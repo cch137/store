@@ -1,0 +1,21 @@
+{
+  "name": "@cch137/store",
+  "version": "0.0.1",
+  "description": "",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "devbuild": "tsc -w",
+    "devstart": "nodemon ./test/index.js",
+    "test": "npm-run-all --parallel devbuild devstart"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cch137/store"
+  },
+  "author": "cch137",
+  "license": "ISC",
+  "dependencies": {
+    "@types/node": "^20.11.19"
+  }
+}
