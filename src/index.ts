@@ -2,6 +2,25 @@ type None = void | undefined | null;
 
 const isNone = (v: any): v is None => v === undefined || v === null;
 
+const defProp = <O extends object>(o: O, k: keyof O, value: any): O =>
+  Object.defineProperty(o, k, {
+    value,
+    writable: false,
+    configurable: true,
+  });
+
+const defGetter = <O extends object, T>(
+  o: O,
+  k: keyof O,
+  getter: () => T,
+  setter?: (v: T) => void
+): O =>
+  Object.defineProperty(o, k, {
+    get: getter,
+    set: setter,
+    configurable: true,
+  });
+
 export type EventName =
   | "on"
   | "off"
@@ -23,6 +42,79 @@ export const events = Object.freeze({
   RESUME: "resume",
 });
 
+type EventListenerMap<T extends object> = Map<EventName, Set<StoreListener<T>>>;
+
+const dispatchEvent = <T extends object>(
+  store: Store<T>,
+  listeners: EventListenerMap<T>,
+  eventName: EventName,
+  updatedDict: StoreUpdatedDict<T> = {}
+) => {
+  const eventListenerSet = listeners.get(eventName);
+  if (!eventListenerSet) return;
+  eventListenerSet.forEach(async (callback) => callback(store, updatedDict));
+};
+
+const addListener = <T extends object>(
+  store: Store<T>,
+  listeners: EventListenerMap<T>,
+  eventName: EventName | StoreListener<T>,
+  listener?: StoreListener<T>
+): (() => void) => {
+  if (listener === undefined) {
+    if (typeof eventName !== "function")
+      throw new Error("Listener must be a function");
+    return addListener(store, listeners, events.CHANGE, eventName);
+  }
+  if (typeof eventName !== "string")
+    throw new Error("Event name must be a string");
+  if (!listeners.has(eventName)) listeners.set(eventName, new Set());
+  const eventListenerSet = listeners.get(eventName)!;
+  eventListenerSet.add(listener);
+  dispatchEvent(store, listeners, events.ON);
+  return () => removeListener(store, listeners, eventName, listener);
+};
+
+const removeListener = <T extends object>(
+  store: Store<T>,
+  listeners: EventListenerMap<T>,
+  eventName: EventName | StoreListener<T>,
+  listener?: StoreListener<T>
+): void => {
+  if (listener === undefined) {
+    if (typeof eventName !== "function")
+      throw new Error("Listener must be a function");
+    return removeListener(store, listeners, events.CHANGE, eventName);
+  }
+  if (typeof eventName !== "string")
+    throw new Error("Event name must be a string");
+  if (!listeners.has(eventName)) return;
+  listeners.get(eventName)!.delete(listener);
+  dispatchEvent(store, listeners, events.OFF);
+};
+
+const assignObject = async <T extends object>(
+  store: Store<T>,
+  listeners: EventListenerMap<T>,
+  targer: T,
+  obj?: None | Partial<T> | StoreSetter<T>,
+  dispatch = true
+): Promise<void> => {
+  if (!obj) return;
+  if (typeof obj === "function") {
+    return await store.$assign(await obj(store), dispatch);
+  }
+  if (Array.isArray(obj) && Array.isArray(targer)) {
+    targer.length = 0;
+    obj.map((i, v) => (targer[i] = v));
+  } else {
+    Object.assign(targer, obj);
+  }
+  if (dispatch) {
+    dispatchEvent(store, listeners, events.CHANGE, obj);
+  }
+};
+
 export type StoreUpdatedDict<T extends object> = Partial<T>;
 
 export type StoreListener<T extends object> = (
@@ -41,9 +133,9 @@ export type StoreSetter<T extends object> = (
 
 export type Store<T extends object> = T & {
   readonly $assign: (
-    o: StoreSetter<Store<T>> | Partial<T> | None,
+    o: StoreSetter<T> | Partial<T> | None,
     dispatch?: boolean
-  ) => Promise<T>;
+  ) => Promise<void>;
   readonly $on: ((callback: StoreListener<T>) => () => void) &
     ((event: EventName, callback: StoreListener<T>) => () => void);
   readonly $off: ((callback: StoreListener<T>) => void) &
@@ -69,14 +161,14 @@ type LazyAutoUpdatable<T extends object> = AutoUpdatable<T> & {
 };
 
 type InitNeeded<T extends object> = T & {
-  readonly $init: () => Promise<T>;
+  readonly $init: (force?: boolean) => Promise<T>;
   readonly $inited: boolean;
   readonly $initing: boolean;
 };
 
-type Resettable<T, InitialValue = T> = T & {
-  readonly $initial: InitialValue;
-  readonly $reset: () => InitialValue;
+type Resettable<T> = T & {
+  readonly $initial: T;
+  readonly $reset: () => Promise<T>;
 };
 
 type StoreOptions<T extends object> = Partial<{
@@ -90,8 +182,8 @@ type StoreOptions<T extends object> = Partial<{
 }>;
 
 type AutoUpdatableOption<T extends object> = {
-  updatable: true;
   update: StoreSetter<T>;
+  updatable?: true;
   interval?: number | None;
 } & StoreOptions<T>;
 
@@ -109,15 +201,21 @@ type LazyAutoUpdatableOption<T extends object> = {
  * when initNeed is a `n` number, the store init `n` millisecond after store created.
  * `init()` return the current value of the store.
  */
-type InitNeededOption<T extends object> = {
-  initNeeded: true | "lazy" | "immediate" | number;
-} & (
+type InitNeededOption<T extends object> = (
   | {
-      update: StoreSetter<T>;
-    }
-  | {
+      initNeeded?: true;
       init: StoreSetter<T>;
     }
+  | ({
+      initNeeded: true | "lazy" | "immediate" | number;
+    } & (
+      | {
+          update: StoreSetter<T>;
+        }
+      | {
+          init: StoreSetter<T>;
+        }
+    ))
 ) &
   StoreOptions<T>;
 
@@ -187,299 +285,208 @@ function store<T extends object>(data: T, options?: StoreOptions<T>): Store<T>;
 function store<T extends object>(data: T, options: StoreOptions<T> = {}) {
   if (typeof data !== "object") throw new Error("Data must be an object");
 
-  const listeners = new Map<EventName, Set<StoreListener<T>>>();
+  const listeners: EventListenerMap<T> = new Map();
 
-  const dispatchEvent = (
-    eventName: EventName,
-    updatedDict: StoreUpdatedDict<T> = {}
-  ) => {
-    const eventListenerSet = listeners.get(eventName);
-    if (!eventListenerSet) return;
-    eventListenerSet.forEach(async (callback) => callback(proxy, updatedDict));
-  };
-
-  const $assign = async (
-    obj?: None | Partial<T> | StoreSetter<T>,
-    dispatch = true
-  ): Promise<T> => {
-    if (!obj) return data;
-    if (typeof obj === "function") {
-      return await $assign(await obj(proxy), dispatch);
-    }
-    if (Array.isArray(obj) && Array.isArray(data)) {
-      data.splice(0, data.length);
-      for (let i = 0; i < obj.length; i++) data[i] = obj[i];
-    } else {
-      Object.assign(data, obj);
-    }
-    if (dispatch) {
-      dispatchEvent(events.CHANGE, obj);
-    }
-    return data;
-  };
-
-  const $on = (
-    eventName: EventName | StoreListener<T>,
-    listener?: StoreListener<T>
-  ): (() => void) => {
-    if (listener === undefined) {
-      if (typeof eventName !== "function")
-        throw new Error("Listener must be a function");
-      return $on(events.CHANGE, eventName);
-    }
-    if (typeof eventName !== "string")
-      throw new Error("Event name must be a string");
-    if (!listeners.has(eventName)) listeners.set(eventName, new Set());
-    const eventListenerSet = listeners.get(eventName)!;
-    eventListenerSet.add(listener);
-    dispatchEvent(events.ON);
-    return () => $off(eventName, listener);
-  };
-
-  const $off = (
-    eventName: EventName | StoreListener<T>,
-    listener?: StoreListener<T>
-  ): void => {
-    if (listener === undefined) {
-      if (typeof eventName !== "function")
-        throw new Error("Listener must be a function");
-      return $off(events.CHANGE, eventName);
-    }
-    if (typeof eventName !== "string")
-      throw new Error("Event name must be a string");
-    if (!listeners.has(eventName)) return;
-    listeners.get(eventName)!.delete(listener);
-    dispatchEvent(events.OFF);
-  };
-
-  const proxy: Store<T> = new Proxy(data, {
+  const store: Store<T> = new Proxy(data, {
     get(target, key) {
-      return key in storeProps
-        ? (storeProps as any)[key]
-        : (target as T)[key as keyof T];
+      return key in props ? (props as any)[key] : (target as T)[key as keyof T];
     },
     set(target, key, value) {
-      if (key in storeProps) {
-        (storeProps as any)[key] = value;
+      const updatedDict = { [key]: value } as Partial<T>;
+      if (key in props) {
+        (props as any)[key] = value;
+        dispatchEvent(store, listeners, events.CHANGE, updatedDict);
         return true;
       }
-      const updatedDict = { [key]: value } as Partial<T>;
-      $assign(updatedDict);
+      props.$assign(updatedDict);
       return true;
     },
   }) as Store<T>;
 
-  const storeProps = {
-    $on,
-    $off,
-    $assign,
-    get $object() {
-      return data;
-    },
-  } as Partial<
-    Store<
-      AutoUpdatable<T> & LazyAutoUpdatable<T> & InitNeeded<T> & Resettable<T>
-    >
-  >;
+  const props = {} as Store<T> &
+    Partial<
+      Store<
+        AutoUpdatable<T> & LazyAutoUpdatable<T> & InitNeeded<T> & Resettable<T>
+      >
+    >;
+
+  defProp(
+    props,
+    "$on",
+    (
+      eventName: EventName | StoreListener<T>,
+      listener?: StoreListener<T>
+    ): (() => void) => addListener(store, listeners, eventName, listener)
+  );
+
+  defProp(
+    props,
+    "$off",
+    (
+      eventName: EventName | StoreListener<T>,
+      listener?: StoreListener<T>
+    ): void => removeListener(store, listeners, eventName, listener)
+  );
+
+  defProp(
+    props,
+    "$assign",
+    async (obj?: None | Partial<T> | StoreSetter<T>, dispatch = true) =>
+      assignObject(store, listeners, data, obj, dispatch)
+  );
+
+  defGetter(props, "$object", () => data);
 
   const {
     updatable = false,
     update,
-    interval = NaN,
-    timeout = NaN,
     initNeeded = false,
     init,
     resettable = false,
   } = options;
 
-  if (typeof update === "function" && updatable) {
-    let $updating = false;
-    let $lastUpdated = new Date();
-    let $interval = isNone(interval) ? NaN : interval;
+  let { timeout = NaN, interval = NaN } = options;
+
+  if (typeof update === "function") {
     let autoUpdateTimeout: NodeJS.Timeout;
 
-    const $update = async () => {
+    defGetter(
+      props,
+      "$interval",
+      () => interval,
+      (v) => (interval = isNone(v) ? NaN : v)
+    );
+    defProp(props, "$lastUpdated", new Date());
+    defProp(props, "$updating", false);
+
+    defProp(props, "$update", async () => {
       try {
         clearTimeout(autoUpdateTimeout);
-        $updating = true;
-        await $assign(update);
-        dispatchEvent(events.UPDATE);
+        defProp(props, "$updating", true);
+        await props.$assign(update);
+        dispatchEvent(store, listeners, events.UPDATE);
       } catch (e) {
         console.error(e);
       } finally {
-        $updating = false;
-        $lastUpdated = new Date();
-        if (!$paused && typeof $interval === "number" && !isNaN($interval)) {
-          autoUpdateTimeout = setTimeout($update, $interval);
-        }
+        defProp(props, "$updating", false);
+        defProp(props, "$lastUpdated", new Date());
+        if (
+          !props.$paused &&
+          typeof props.$interval === "number" &&
+          !isNaN(props.$interval)
+        )
+          autoUpdateTimeout = setTimeout(props.$update!, props.$interval);
       }
       return data;
-    };
+    });
 
-    let $paused = false;
+    defProp(props, "$pause", () => {
+      defProp(props, "$paused", true);
+      dispatchEvent(store, listeners, events.PAUSE);
+      clearTimeout(autoUpdateTimeout);
+    });
 
-    Object.defineProperties(storeProps, {
-      $interval: {
-        get() {
-          return $interval;
-        },
-        set(v) {
-          $interval = isNone(v) ? NaN : Number(v);
-        },
-      },
-      $update: {
-        value: $update,
-      },
-      $updating: {
-        get() {
-          return $updating;
-        },
-      },
-      $lastUpdated: {
-        get() {
-          return $lastUpdated;
-        },
-      },
-      $paused: {
-        get() {
-          return $paused;
-        },
-      },
-      $pause: {
-        value: () => {
-          $paused = true;
-          dispatchEvent(events.PAUSE);
-          clearTimeout(autoUpdateTimeout);
-        },
-      },
-      $resume: {
-        value: () => {
-          $paused = false;
-          dispatchEvent(events.RESUME);
-          if (typeof $interval === "number" && !isNaN($interval)) {
-            autoUpdateTimeout = setTimeout(
-              $update,
-              Math.max(0, $interval - Date.now() - $lastUpdated.getTime())
-            );
-          }
-        },
-      },
+    defProp(props, "$resume", () => {
+      if (!props.$paused) return;
+      defProp(props, "$paused", false);
+      dispatchEvent(store, listeners, events.RESUME);
+      if (typeof props.$interval === "number" && !isNaN(props.$interval))
+        autoUpdateTimeout = setTimeout(
+          props.$update!,
+          Math.max(
+            0,
+            props.$interval - Date.now() - props.$lastUpdated!.getTime()
+          )
+        );
     });
 
     if (updatable === "lazy") {
-      let $timeout = isNone(timeout) ? NaN : timeout;
-      let $lastActived = new Date();
+      defGetter(
+        props,
+        "$timeout",
+        () => timeout,
+        (v) => (timeout = isNone(v) ? NaN : v)
+      );
 
-      const $active = () => {
-        $lastActived = new Date();
-        if ($paused) storeProps.$resume!();
-      };
+      defProp(props, "$lastActived", new Date());
 
-      $on(events.UPDATE, () => {
-        if ($lastActived.getTime() + $timeout < Date.now()) {
-          storeProps.$pause!();
-        }
+      defProp(props, "$active", () => {
+        defProp(props, "$lastActived", new Date());
+        if (props.$paused) props.$resume!();
       });
 
-      const $lazyUpdate = async () => {
-        if ($lastActived.getTime() + $timeout > Date.now())
-          return await $update();
+      defProp(props, "$lazyUpdate", async () => {
+        if (props.$lastActived!.getTime() + timeout > Date.now())
+          return await props.$update!();
         return data;
-      };
+      });
 
-      Object.defineProperties(storeProps, {
-        $active: {
-          value: $active,
-        },
-        $lazyUpdate: {
-          value: $lazyUpdate,
-        },
-        $timeout: {
-          get() {
-            return $timeout;
-          },
-          set(v) {
-            $timeout = isNone(v) ? NaN : Number(v);
-          },
-        },
-        $lastActived: {
-          get() {
-            return $lastActived;
-          },
-        },
+      props.$on(events.UPDATE, () => {
+        if (props.$lastActived!.getTime() + timeout < Date.now()) {
+          props.$pause!();
+        }
       });
     }
   }
 
-  if (typeof initNeeded === "number" || initNeeded) {
-    let $inited: Promise<T> | boolean = false;
-    let $initing = false;
+  if (
+    typeof initNeeded === "number" ||
+    typeof init === "function" ||
+    initNeeded
+  ) {
+    let initPromise: Promise<void> | void = void 0;
 
-    const $init = async () => {
-      if ($inited || $initing) {
-        await $inited;
+    defProp(props, "$inited", false);
+    defProp(props, "$initing", false);
+    defProp(props, "$init", async (force = false) => {
+      if (!force && (initPromise || props.$initing)) {
+        await initPromise;
         return data;
       }
-      dispatchEvent(events.INIT);
-      $initing = true;
       try {
-        $inited = (async () => await $assign(await (init || update)!(proxy)))();
-        await $inited;
+        defProp(props, "$initing", true);
+        defProp(props, "$inited", false);
+        dispatchEvent(store, listeners, events.INIT);
+        initPromise = (async () =>
+          await props.$assign(await (init || update)!(store)))();
+        await initPromise;
+        initPromise = void 0;
       } catch (e) {
         console.error(e);
       } finally {
-        $initing = false;
-        $inited = true;
+        defProp(props, "$initing", false);
+        defProp(props, "$inited", true);
       }
       return data;
-    };
+    });
 
     switch (initNeeded) {
       case "immediate": {
-        $init();
+        props.$init!();
         break;
       }
       case "lazy": {
-        $on(events.ON, $init);
+        props.$on(events.ON, () => props.$init!());
         break;
       }
       default:
-        if (typeof initNeeded === "number") {
-          setTimeout($init, initNeeded);
-        }
+        if (typeof initNeeded === "number")
+          setTimeout(props.$init!, initNeeded);
     }
-
-    Object.defineProperties(storeProps, {
-      $inited: {
-        get() {
-          return Boolean($inited);
-        },
-      },
-      $initing: {
-        get() {
-          return $initing;
-        },
-      },
-      $init: {
-        value: $init,
-      },
-    });
   }
 
   if (resettable) {
-    Object.defineProperties(storeProps, {
-      $initial: { value: { ...data } },
-      $reset: {
-        value: () => {
-          $assign(storeProps.$initial);
-          dispatchEvent(events.RESET);
-          return;
-        },
-      },
+    defProp(props, "$initial", { ...data });
+    defProp(props, "$reset", async () => {
+      const initialValue = props.$initial;
+      dispatchEvent(store, listeners, events.RESET);
+      for (const i in data) delete data[i];
+      props.$assign(props.$initial);
+      return initialValue;
     });
   }
 
-  return proxy;
+  return store;
 }
 
 export default store;
